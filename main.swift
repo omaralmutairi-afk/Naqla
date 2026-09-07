@@ -129,7 +129,11 @@ extension NSColor {
 
     var hexString: String {
         guard let c = usingColorSpace(.sRGB) else { return "#5DCDA4" }
-        return String(format: "#%02X%02X%02X", Int(c.redComponent * 255), Int(c.greenComponent * 255), Int(c.blueComponent * 255))
+        // Wide-gamut picks convert to components outside 0…1, which without
+        // clamping format to three characters and make the whole string
+        // unparseable on the way back in — the accent would silently reset.
+        func channel(_ v: CGFloat) -> Int { Int((min(max(v, 0), 1) * 255).rounded()) }
+        return String(format: "#%02X%02X%02X", channel(c.redComponent), channel(c.greenComponent), channel(c.blueComponent))
     }
 }
 
@@ -181,6 +185,7 @@ final class RecentAppsTracker {
     }
 
     func start() {
+        seedFromRunningApps()
         let center = NSWorkspace.shared.notificationCenter
         center.addObserver(
             self,
@@ -194,6 +199,17 @@ final class RecentAppsTracker {
             name: NSWorkspace.didTerminateApplicationNotification,
             object: nil
         )
+    }
+
+    /// The tracker otherwise only learns of an app when it activates, so right
+    /// after login the wheel would come up empty until the user happened to
+    /// switch apps. Launch order carries no recency, so this just makes sure
+    /// whatever is frontmost leads.
+    private func seedFromRunningApps() {
+        let mine = ProcessInfo.processInfo.processIdentifier
+        apps = NSWorkspace.shared.runningApplications.filter {
+            $0.activationPolicy == .regular && $0.processIdentifier != mine && !$0.isTerminated
+        }.sorted { lhs, rhs in lhs.isActive && !rhs.isActive }
     }
 
     @objc private func appActivated(_ note: Notification) {
@@ -250,8 +266,17 @@ final class AppIconView: NSView {
     }
 
     // The badge sits in the square's top-right corner, which the circular
-    // icon leaves empty — so it covers almost none of the artwork.
-    private var badgeSize: CGFloat { max(15, bounds.width * 0.40) }
+    // icon leaves empty — so it covers almost none of the artwork. The upper
+    // bound is what keeps it off the icon's centre: a flat 15pt minimum meant
+    // that once icons shrank past 30pt (seven apps or more) the badge reached
+    // the middle, and an ordinary click on an app force-quit it instead.
+    private var badgeSize: CGFloat { min(bounds.width * 0.46, max(13, bounds.width * 0.40)) }
+
+    /// Under ~22pt there is no size that is both clear of the centre and big
+    /// enough to aim at, so those icons get no badge at all rather than a
+    /// 7pt one. Shrinking the icons further is the user's own choice, and
+    /// losing force-quit there beats killing an app by mis-clicking.
+    private var showsBadge: Bool { badgeSize >= 10 }
 
     private var badgeFrame: NSRect {
         let s = badgeSize
@@ -317,7 +342,7 @@ final class AppIconView: NSView {
     override func mouseEntered(with event: NSEvent) {
         isHovering = true
         setScale(hoverScale, duration: 0.14)
-        setBadgeVisible(true)
+        setBadgeVisible(showsBadge)
     }
 
     override func mouseExited(with event: NSEvent) {
@@ -341,7 +366,12 @@ final class AppIconView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
-        let point = layerSpacePoint(convert(event.locationInWindow, from: nil))
+        let raw = convert(event.locationInWindow, from: nil)
+        // mouseUp is delivered here even when the release lands far away,
+        // so a press the user dragged off and abandoned must do nothing.
+        guard bounds.contains(raw) else { return }
+
+        let point = layerSpacePoint(raw)
         if !closeBadge.isHidden && badgeFrame.contains(point) {
             if !app.forceTerminate() {
                 app.terminate()
@@ -513,7 +543,6 @@ final class WheelContainerView: NSView {
     private var collapseWork: DispatchWorkItem?
 
     private var dragStartMouse: NSPoint = .zero
-    private var dragStartWindowOrigin: NSPoint = .zero
     private var isDraggingCore = false
     private var corner: WheelCorner = .topLeft
 
@@ -594,7 +623,13 @@ final class WheelContainerView: NSView {
     }
 
     private func radius(for count: Int) -> CGFloat {
-        min(160, 78 + 9 * CGFloat(count - 1)) * CGFloat(SettingsStore.shared.iconScale)
+        let scale = CGFloat(SettingsStore.shared.iconScale)
+        let wanted = min(160, 78 + 9 * CGFloat(count - 1)) * scale
+        // The window is a fixed 250pt, so past roughly 1.15× the icons at the
+        // ends of the arc were being cut off by its edge. Cap the radius using
+        // the largest an icon can get, and the whole arc stays inside.
+        let room = Self.expandedSize - Self.coreInset - (48 * scale) / 2 - 2
+        return min(wanted, room)
     }
 
     /// Icons shrink as the list grows so the arc keeps them from touching.
@@ -756,17 +791,22 @@ final class WheelContainerView: NSView {
         collapseWork?.cancel()
         collapse()
         dragStartMouse = NSEvent.mouseLocation
-        dragStartWindowOrigin = window?.frame.origin ?? .zero
     }
 
     override func mouseDragged(with event: NSEvent) {
         // Never move the window from a stray/misrouted event — only a drag
         // that genuinely began on the core circle may reposition it.
-        guard isDraggingCore else { return }
+        guard isDraggingCore, let window else { return }
+        // Moving by increments off the window's *current* origin, rather than
+        // off one captured at mouseDown: collapse() finishes mid-drag and
+        // resizeWindow shifts the origin by 174pt to pin the corner edge, and
+        // a captured origin would then yank the wheel back by that much.
         let current = NSEvent.mouseLocation
         let dx = current.x - dragStartMouse.x
         let dy = current.y - dragStartMouse.y
-        window?.setFrameOrigin(NSPoint(x: dragStartWindowOrigin.x + dx, y: dragStartWindowOrigin.y + dy))
+        dragStartMouse = current
+        let origin = window.frame.origin
+        window.setFrameOrigin(NSPoint(x: origin.x + dx, y: origin.y + dy))
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -1111,20 +1151,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
         RecentAppsTracker.shared.start()
         migrateLoginItemIfNeeded()
-
-        let trustLine = "[Naqla] Accessibility trusted: \(AXIsProcessTrusted()) at \(Date())\n"
-        print(trustLine)
-        fflush(stdout)
-        let logPath = "/Users/omar/Naqla/trust-check.log"
-        if let data = trustLine.data(using: .utf8) {
-            if FileManager.default.fileExists(atPath: logPath), let handle = FileHandle(forWritingAtPath: logPath) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                handle.closeFile()
-            } else {
-                try? data.write(to: URL(fileURLWithPath: logPath))
-            }
-        }
 
         let size = WheelContainerView.collapsedSize
         let visible = NSScreen.main?.visibleFrame
