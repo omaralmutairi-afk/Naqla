@@ -622,23 +622,32 @@ final class WheelContainerView: NSView {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.13, execute: work)
     }
 
+    private static let maxIconDiameter: CGFloat = 48
+
     private func radius(for count: Int) -> CGFloat {
         let scale = CGFloat(SettingsStore.shared.iconScale)
         let wanted = min(160, 78 + 9 * CGFloat(count - 1)) * scale
         // The window is a fixed 250pt, so past roughly 1.15× the icons at the
         // ends of the arc were being cut off by its edge. Cap the radius using
         // the largest an icon can get, and the whole arc stays inside.
-        let room = Self.expandedSize - Self.coreInset - (48 * scale) / 2 - 2
+        let room = Self.expandedSize - Self.coreInset - (Self.maxIconDiameter * scale) / 2 - 2
         return min(wanted, room)
     }
 
     /// Icons shrink as the list grows so the arc keeps them from touching.
     private func iconSize(for count: Int) -> CGFloat {
         let scale = CGFloat(SettingsStore.shared.iconScale)
-        guard count > 1 else { return 48 * scale }
+        guard count > 1 else { return Self.maxIconDiameter * scale }
         let stepDeg = (arcEnd - arcStart) / Double(count - 1)
         let chord = 2 * radius(for: count) * CGFloat(abs(sin(stepDeg / 2 * .pi / 180)))
-        return min(48 * scale, max(22 * scale, chord * 0.88))
+        let size = min(Self.maxIconDiameter * scale, max(22 * scale, chord * 0.88))
+        // radius(for:)'s window-edge cap can shrink the chord well below what
+        // the 22pt-scaled floor above assumes is always available — at high
+        // icon counts and scales this let the floor push icons past merely
+        // touching into real, sometimes severe overlap (confirmed up to
+        // ~9pt at scale 1.3 with 14 apps). Never let the floor win over
+        // actually not touching, even if that means dropping below it.
+        return min(size, chord - 1)
     }
 
     private func angle(for index: Int, count: Int) -> Double {
