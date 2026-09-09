@@ -49,6 +49,7 @@ final class SettingsStore {
         static let iconScale = "iconScale"
         static let accentColor = "accentColorHex"
         static let wheelOpacity = "wheelOpacity"
+        static let language = "appLanguage"
     }
 
     private func notifyChanged() {
@@ -111,6 +112,50 @@ final class SettingsStore {
     var launchAtLogin: Bool {
         get { LoginItem.isEnabled }
         set { LoginItem.setEnabled(newValue); notifyChanged() }
+    }
+
+    var language: AppLanguage {
+        get { AppLanguage(rawValue: d.string(forKey: Key.language) ?? "") ?? .ar }
+        set { d.set(newValue.rawValue, forKey: Key.language); notifyChanged() }
+    }
+}
+
+enum AppLanguage: String, CaseIterable {
+    case ar, en
+    var displayName: String { self == .ar ? "العربية" : "English" }
+    var layoutDirection: NSUserInterfaceLayoutDirection { self == .ar ? .rightToLeft : .leftToRight }
+}
+
+/// Every user-facing string in one place, since this single-file app has no
+/// Xcode asset pipeline for real .lproj/NSLocalizedString support. Looked up
+/// fresh each call against the current setting, so nothing needs to observe
+/// language changes just to stay correct — only already-built UI text (see
+/// SettingsWindowController, rebuilt wholesale on change) needs a refresh.
+enum L {
+    enum Key {
+        case settingsMenuItem, quitMenuItem, pressCombo, settingsWindowTitle,
+             hotkeyRow, maxAppsRow, iconSizeRow, wheelColorRow, wheelOpacityRow,
+             languageRow, launchAtLoginCheckbox, quitButton
+    }
+
+    private static let table: [Key: (ar: String, en: String)] = [
+        .settingsMenuItem: ("الإعدادات", "Settings"),
+        .quitMenuItem: ("إنهاء نَقْلة", "Quit Naqla"),
+        .pressCombo: ("اضغط تركيبة…", "Press a combo…"),
+        .settingsWindowTitle: ("إعدادات نَقْلة", "Naqla Settings"),
+        .hotkeyRow: ("اختصار الإظهار/الإخفاء:", "Show/hide hotkey:"),
+        .maxAppsRow: ("أقصى عدد تطبيقات:", "Max apps:"),
+        .iconSizeRow: ("حجم الأيقونات:", "Icon size:"),
+        .wheelColorRow: ("لون العجلة:", "Wheel color:"),
+        .wheelOpacityRow: ("شفافية العجلة:", "Wheel opacity:"),
+        .languageRow: ("اللغة:", "Language:"),
+        .launchAtLoginCheckbox: ("تشغيل تلقائي عند تسجيل الدخول", "Launch at login"),
+        .quitButton: ("إنهاء نَقْلة", "Quit Naqla"),
+    ]
+
+    static func t(_ key: Key) -> String {
+        let pair = table[key]!
+        return SettingsStore.shared.language == .ar ? pair.ar : pair.en
     }
 }
 
@@ -854,11 +899,11 @@ final class WheelContainerView: NSView {
     override func rightMouseDown(with event: NSEvent) {
         guard coreRect.contains(convert(event.locationInWindow, from: nil)) else { return }
         let menu = NSMenu()
-        let settingsItem = NSMenuItem(title: "الإعدادات", action: #selector(openSettings), keyEquivalent: "")
+        let settingsItem = NSMenuItem(title: L.t(.settingsMenuItem), action: #selector(openSettings), keyEquivalent: "")
         settingsItem.target = self
         menu.addItem(settingsItem)
         menu.addItem(.separator())
-        let quitItem = NSMenuItem(title: "إنهاء نَقْلة", action: #selector(quit), keyEquivalent: "")
+        let quitItem = NSMenuItem(title: L.t(.quitMenuItem), action: #selector(quit), keyEquivalent: "")
         quitItem.target = self
         menu.addItem(quitItem)
         menu.popUp(positioning: nil, at: event.locationInWindow, in: self)
@@ -991,7 +1036,7 @@ final class KeyRecorderView: NSView {
         layer?.borderWidth = 1
         layer?.borderColor = (isRecording ? NSColor.controlAccentColor : NSColor.separatorColor).cgColor
         layer?.backgroundColor = (isRecording ? NSColor.controlAccentColor.withAlphaComponent(0.12) : NSColor.controlBackgroundColor).cgColor
-        label.stringValue = isRecording ? "اضغط تركيبة…" : Self.symbolString(keyCode: keyCode, modifiers: modifiers)
+        label.stringValue = isRecording ? L.t(.pressCombo) : Self.symbolString(keyCode: keyCode, modifiers: modifiers)
     }
 
     private static func carbonModifiers(from flags: NSEvent.ModifierFlags) -> UInt32 {
@@ -1018,6 +1063,8 @@ final class KeyRecorderView: NSView {
 /// (hotkey, app count, icon size, accent color, opacity, login item) lives
 /// here now, editable like any normal Mac app's preferences window.
 final class SettingsWindowController: NSWindowController, NSWindowDelegate {
+    private var lastLanguage: AppLanguage?
+
     convenience init() {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 420, height: 400),
@@ -1025,11 +1072,23 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             backing: .buffered,
             defer: false
         )
-        window.title = "إعدادات نَقْلة"
         window.isReleasedWhenClosed = false
         window.center()
         self.init(window: window)
         window.delegate = self
+        buildUI(in: window)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(settingsChanged), name: .naqlaSettingsChanged, object: nil
+        )
+    }
+
+    /// Only the language toggle needs a full teardown-and-rebuild — every
+    /// other control already reads/writes SettingsStore live. Rebuilding on
+    /// every settings change would be wasteful (and would drop focus/drag
+    /// state mid-interaction with a slider), so this only fires on an actual
+    /// language flip.
+    @objc private func settingsChanged() {
+        guard let window, SettingsStore.shared.language != lastLanguage else { return }
         buildUI(in: window)
     }
 
@@ -1039,7 +1098,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     private func row(_ title: String, _ control: NSView) -> NSStackView {
         let label = NSTextField(labelWithString: title)
-        label.alignment = .right
+        label.alignment = .natural
         label.translatesAutoresizingMaskIntoConstraints = false
         label.widthAnchor.constraint(equalToConstant: 190).isActive = true
         let stack = NSStackView(views: [label, control])
@@ -1051,8 +1110,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     private func buildUI(in window: NSWindow) {
         let settings = SettingsStore.shared
+        lastLanguage = settings.language
+
+        window.title = L.t(.settingsWindowTitle)
+
         let content = NSView()
-        content.userInterfaceLayoutDirection = .rightToLeft
+        content.userInterfaceLayoutDirection = settings.language.layoutDirection
         window.contentView = content
 
         let stack = NSStackView()
@@ -1067,7 +1130,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -28),
         ])
 
-        let heading = NSTextField(labelWithString: "إعدادات نَقْلة")
+        let heading = NSTextField(labelWithString: L.t(.settingsWindowTitle))
         heading.font = .systemFont(ofSize: 18, weight: .semibold)
         stack.addArrangedSubview(heading)
 
@@ -1077,7 +1140,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             settings.hotKeyCode = code
             settings.hotKeyModifiers = mods
         }
-        stack.addArrangedSubview(row("اختصار الإظهار/الإخفاء:", recorder))
+        stack.addArrangedSubview(row(L.t(.hotkeyRow), recorder))
 
         // Max apps
         let maxAppsField = NSTextField(labelWithString: "\(settings.maxApps)")
@@ -1092,35 +1155,47 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         self.maxAppsField = maxAppsField
         let stepperRow = NSStackView(views: [stepper, maxAppsField])
         stepperRow.spacing = 8
-        stack.addArrangedSubview(row("أقصى عدد تطبيقات:", stepperRow))
+        stack.addArrangedSubview(row(L.t(.maxAppsRow), stepperRow))
 
         // Icon scale
         let iconSlider = NSSlider(value: settings.iconScale, minValue: 0.7, maxValue: 1.3, target: self, action: #selector(iconScaleChanged(_:)))
         iconSlider.translatesAutoresizingMaskIntoConstraints = false
         iconSlider.widthAnchor.constraint(equalToConstant: 160).isActive = true
-        stack.addArrangedSubview(row("حجم الأيقونات:", iconSlider))
+        stack.addArrangedSubview(row(L.t(.iconSizeRow), iconSlider))
 
         // Accent color
         let colorWell = NSColorWell()
         colorWell.color = settings.accentColor
         colorWell.target = self
         colorWell.action = #selector(accentColorChanged(_:))
-        stack.addArrangedSubview(row("لون العجلة:", colorWell))
+        stack.addArrangedSubview(row(L.t(.wheelColorRow), colorWell))
 
         // Opacity
         let opacitySlider = NSSlider(value: settings.wheelOpacity, minValue: 0.5, maxValue: 1.0, target: self, action: #selector(opacityChanged(_:)))
         opacitySlider.translatesAutoresizingMaskIntoConstraints = false
         opacitySlider.widthAnchor.constraint(equalToConstant: 160).isActive = true
-        stack.addArrangedSubview(row("شفافية العجلة:", opacitySlider))
+        stack.addArrangedSubview(row(L.t(.wheelOpacityRow), opacitySlider))
+
+        // Language
+        let languagePopup = NSPopUpButton()
+        languagePopup.addItems(withTitles: AppLanguage.allCases.map(\.displayName))
+        languagePopup.selectItem(at: AppLanguage.allCases.firstIndex(of: settings.language) ?? 0)
+        languagePopup.target = self
+        languagePopup.action = #selector(languageChanged(_:))
+        stack.addArrangedSubview(row(L.t(.languageRow), languagePopup))
 
         // Launch at login
-        let loginCheckbox = NSButton(checkboxWithTitle: "تشغيل تلقائي عند تسجيل الدخول", target: self, action: #selector(launchAtLoginChanged(_:)))
+        let loginCheckbox = NSButton(checkboxWithTitle: L.t(.launchAtLoginCheckbox), target: self, action: #selector(launchAtLoginChanged(_:)))
         loginCheckbox.state = settings.launchAtLogin ? .on : .off
         stack.addArrangedSubview(loginCheckbox)
 
-        let quitButton = NSButton(title: "إنهاء نَقْلة", target: self, action: #selector(quitApp))
+        let quitButton = NSButton(title: L.t(.quitButton), target: self, action: #selector(quitApp))
         quitButton.bezelStyle = .rounded
         stack.addArrangedSubview(quitButton)
+    }
+
+    @objc private func languageChanged(_ sender: NSPopUpButton) {
+        SettingsStore.shared.language = AppLanguage.allCases[sender.indexOfSelectedItem]
     }
 
     private var maxAppsField: NSTextField?
